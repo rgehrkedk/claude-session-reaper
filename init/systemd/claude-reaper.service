@@ -1,0 +1,11 @@
+# Reference copy. `claude-reaper install` writes this for you (with the real path).
+# Manual install:
+#   cp claude-reaper.service claude-reaper.timer ~/.config/systemd/user/
+#   edit ExecStart below to your claude-reaper path, then:
+#   systemctl --user daemon-reload && systemctl --user enable --now claude-reaper.timer
+[Unit]
+Description=Reap parked idle Claude Code sessions
+
+[Service]
+Type=oneshot
+ExecStart=/REPLACE/WITH/PATH/TO/claude-reaper --quiet reap

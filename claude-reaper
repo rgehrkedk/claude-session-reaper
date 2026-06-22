@@ -1,0 +1,566 @@
+#!/usr/bin/env bash
+# claude-reaper — reclaim RAM from parked, idle, non-working Claude Code sessions.
+#
+# Kills ONLY local session workers that have been idle for --idle-hours (default 3)
+# AND are provably not working. Non-destructive: a killed session's transcript
+# persists under ~/.claude/projects, so the conversation is recoverable with
+# `claude --resume <id>`. What's lost is the live process — you re-attach by resuming.
+#
+# A session is SPARED (never killed) if ANY of these hold:
+#   • it's this tool's own / the invoking session
+#   • its transcript was last written within --idle-hours      → recently active
+#   • it has a live build/test descendant (BUSY_PROCS)         → working
+#   • it's younger than --grace-mins (default 30)              → just started
+#   • its subtree is burning CPU right now                     → working
+#   • a user `spare` hook vetoes the kill
+#   • its session id / transcript can't be found or parsed     → fail-safe, don't touch
+#
+# Default subcommand is `status` (read-only). `reap` does the killing. macOS + Linux.
+#
+#   claude-reaper                 show what WOULD be reaped (safe, read-only)
+#   claude-reaper reap            reap idle parked sessions (recoverable via --resume)
+#   claude-reaper reap --dry-run  scan only, never kill
+#   claude-reaper install         install the periodic scheduler (launchd/systemd)
+#   claude-reaper config --init   write a starter config
+#
+# https://github.com/rgehrkedk/claude-session-reaper
+# Fills anthropics/claude-code#44321 (no built-in CLI reaper).
+
+# NOT `set -e`: a failed kill must never abort the run.
+set -uo pipefail
+
+VERSION="0.1.0"
+SELF_NAME="claude-reaper"
+
+# ── Paths (XDG, overridable by env/config) ──────────────────────
+CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}/claude-reaper"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/claude-reaper"
+DEFAULT_CONFIG="$CONFIG_HOME/config"
+
+# ── Defaults (every one overridable via config file or flag) ─────
+IDLE_HOURS=3
+GRACE_MINS=30
+CPU_WINDOW_SECS=4
+SCHED_INTERVAL=7200                                   # scheduler period, seconds
+PROJECTS_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects"
+LOG_FILE="$STATE_DIR/reaper.log"
+SESSION_MATCH='share/claude/versions'                 # cmdline substring = a session
+SESSION_ID_PATTERNS='both'                            # uuid | cse | both
+WORKER_MATCH=''                                       # optional extra cmdline filter
+MAX_RSS=''                                            # e.g. 4G: also reap big parked sessions
+NOTIFY_CMD=''                                         # shell snippet, fed summary on stdin
+SPARE_HOOK=''                                         # executable; exit 0 = spare
+NOTIFY_HOOK=''                                        # executable; fed summary on stdin
+BUSY_PROCS=''                                         # replace the busy default entirely
+BUSY_PROCS_EXTRA=''                                   # append to the busy default
+
+# Descendants that mean "this session is actively working — spare it". Compiled
+# builds and test runs only — deliberately NOT bare `node`, or every session with
+# an MCP server child would be immortal.
+BUSY_PROCS_DEFAULT='xcodebuild|swift-frontend|swiftc|/clang|clang\+\+|cc1|cc1plus|xctest|swift test| ld |/gcc|/g\+\+|cargo|rustc|go build|make|cmake|ninja|gradle|mvn|webpack|vite|esbuild|rollup|pytest|jest|tsc'
+
+# ── Runtime flags ───────────────────────────────────────────────
+QUIET=0
+DRY_RUN=0
+CONFIG_FILE=''
+
+say() { [ "$QUIET" -eq 1 ] && return 0; printf '%s\n' "$*"; }
+die() { printf '%s\n' "$*" >&2; exit 1; }
+
+# ── Platform compat (the only BSD/GNU divergences) ──────────────
+if date --version >/dev/null 2>&1; then DATE_GNU=1; else DATE_GNU=0; fi
+OS="$(uname -s)"
+
+# ISO 'YYYY-MM-DDTHH:MM:SS' (UTC) → epoch seconds. Both flavors forced to UTC.
+iso_to_epoch() {
+    local ts="$1"
+    if [ "$DATE_GNU" -eq 1 ]; then
+        date -u -d "${ts}Z" +%s 2>/dev/null
+    else
+        date -j -u -f "%Y-%m-%dT%H:%M:%S" "$ts" +%s 2>/dev/null
+    fi
+}
+
+# ── ps etime ([[dd-]hh:]mm:ss) → seconds ────────────────────────
+etime_to_sec() {
+    local e="$1" dd=0 a b c
+    [[ "$e" == *-* ]] && { dd="${e%%-*}"; e="${e#*-}"; }
+    IFS=: read -r a b c <<< "$e"
+    if [ -n "${c:-}" ]; then
+        echo $(( 10#${dd:-0}*86400 + 10#${a:-0}*3600 + 10#${b:-0}*60 + 10#${c:-0} ))
+    else
+        echo $(( 10#${dd:-0}*86400 + 10#${a:-0}*60 + 10#${b:-0} ))
+    fi
+}
+
+# ps TIME ([[dd-]hh:]mm:ss[.frac]) → cumulative CPU seconds.
+cpu_secs() {
+    local t dd=0
+    t=$(ps -o time= -p "$1" 2>/dev/null | tr -d ' ')
+    [ -z "$t" ] && { echo 0; return; }
+    case "$t" in *-*) dd="${t%%-*}"; t="${t#*-}";; esac
+    awk -F: -v dd="$dd" 'BEGIN{s=0}{n=NF; if(n==3)s=$1*3600+$2*60+$3; else if(n==2)s=$1*60+$2; else s=$1; print int(dd*86400+s)}' <<< "$t"
+}
+
+# bytes-with-suffix (4G/512M/1024K/plain-KB) → KB (ps rss unit).
+rss_to_kb() {
+    local v; v="$(printf '%s' "$1" | tr '[:lower:]' '[:upper:]')"
+    case "$v" in
+        *G) echo $(( ${v%G} * 1024 * 1024 )) ;;
+        *M) echo $(( ${v%M} * 1024 )) ;;
+        *K) echo $(( ${v%K} )) ;;
+        *)  echo "$v" ;;
+    esac
+}
+
+human_idle() { printf '%dh%02dm' $(( $1/3600 )) $(( ($1%3600)/60 )); }
+
+# ── Config resolution: flags > $CONFIG_FILE/env > default file > built-ins ──
+load_config() {
+    local f="${CONFIG_FILE:-${CLAUDE_REAPER_CONFIG:-$DEFAULT_CONFIG}}"
+    LOADED_CONFIG=''
+    if [ -f "$f" ]; then
+        # shellcheck disable=SC1090
+        . "$f"
+        LOADED_CONFIG="$f"
+    fi
+    # Hooks: explicit path wins, else discover in the config dir.
+    [ -z "$SPARE_HOOK" ]  && [ -x "$CONFIG_HOME/hooks/spare" ]  && SPARE_HOOK="$CONFIG_HOME/hooks/spare"
+    [ -z "$NOTIFY_HOOK" ] && [ -x "$CONFIG_HOME/hooks/notify" ] && NOTIFY_HOOK="$CONFIG_HOME/hooks/notify"
+    # Compose the busy-process regex.
+    local base="${BUSY_PROCS:-$BUSY_PROCS_DEFAULT}"
+    [ -n "$BUSY_PROCS_EXTRA" ] && base="$base|$BUSY_PROCS_EXTRA"
+    BUSY_RE="$base"
+    IDLE_SECS=$(( IDLE_HOURS * 3600 ))
+    GRACE_SECS=$(( GRACE_MINS * 60 ))
+    MAX_RSS_KB=''
+    [ -n "$MAX_RSS" ] && MAX_RSS_KB="$(rss_to_kb "$MAX_RSS")"
+}
+
+# ── Process-tree helpers ────────────────────────────────────────
+subtree_pids() {
+    local frontier next child depth=0 out="$1"
+    frontier="$(pgrep -P "$1" 2>/dev/null || true)"
+    while [ -n "$frontier" ] && [ "$depth" -lt 12 ]; do
+        next=""
+        for child in $frontier; do
+            out="$out $child"
+            next="$next $(pgrep -P "$child" 2>/dev/null || true)"
+        done
+        frontier="$next"; depth=$((depth + 1))
+    done
+    echo "$out"
+}
+
+# A live build/test descendant = real work → spare.
+has_busy_descendant() {
+    local pids p cargs
+    pids="$(subtree_pids "$1")"
+    for p in $pids; do
+        [ "$p" = "$1" ] && continue
+        cargs="$(ps -o command= -p "$p" 2>/dev/null)" || continue
+        printf '%s' "$cargs" | grep -Eq "$BUSY_RE" && return 0
+    done
+    return 1
+}
+
+# Is the subtree burning CPU right now? Final, misclassification-free check that a
+# stale-looking session isn't mid-work (LLM turn, long compute). Samples cumulative
+# CPU across a short window.
+subtree_cpu_busy() {
+    local pids p s1=0 s2=0
+    pids="$(subtree_pids "$1")"
+    for p in $pids; do s1=$(( s1 + $(cpu_secs "$p") )); done
+    sleep "$CPU_WINDOW_SECS"
+    for p in $pids; do s2=$(( s2 + $(cpu_secs "$p") )); done
+    [ "$s2" -gt "$s1" ]
+}
+
+# Pull a session id from a command line per SESSION_ID_PATTERNS.
+extract_sid() {
+    local args="$1" sid=""
+    case "$SESSION_ID_PATTERNS" in
+        both|cse)  sid=$(grep -oE 'cse_[A-Za-z0-9]+' <<< "$args" | head -1) ;;
+    esac
+    if [ -z "$sid" ]; then
+        case "$SESSION_ID_PATTERNS" in
+            both|uuid) sid=$(grep -oE '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' <<< "$args" | head -1) ;;
+        esac
+    fi
+    printf '%s' "$sid"
+}
+
+# Locate a session's transcript (.jsonl). Local: <uuid>.jsonl. Otherwise grep for it.
+find_transcript() {
+    local sid="$1" f
+    f=$(ls "$PROJECTS_DIR"/*/"${sid}.jsonl" 2>/dev/null | head -1)
+    [ -n "$f" ] && { echo "$f"; return; }
+    grep -lF "$sid" "$PROJECTS_DIR"/*/*.jsonl 2>/dev/null | head -1
+}
+
+# True last activity = last message timestamp INSIDE the transcript, not file mtime
+# (mtime gets bumped by lifecycle writes and would mask a parked session as recent).
+last_activity_epoch() {
+    local ts
+    ts=$(grep -oE '"timestamp":"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}' "$1" 2>/dev/null \
+         | tail -1 | sed 's/.*"timestamp":"//')
+    [ -z "$ts" ] && return 0
+    iso_to_epoch "$ts"
+}
+
+# ── Protect this tool's own session (interactive runs) ──────────
+build_protect_set() {
+    PROTECT=" "
+    CUR_SESSION=""
+    local _p=$$
+    while [ "$_p" -gt 1 ]; do
+        PROTECT="${PROTECT}${_p} "
+        if [ -z "$CUR_SESSION" ]; then
+            case "$(ps -o command= -p "$_p" 2>/dev/null)" in
+                *"$SESSION_MATCH"*) CUR_SESSION="$_p" ;;
+            esac
+        fi
+        _p=$(ps -o ppid= -p "$_p" 2>/dev/null | tr -d ' ')
+        [ -z "$_p" ] && break
+    done
+}
+is_protected() { case "$PROTECT" in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
+
+# ── Scan: populate REAPED_REPORT / REAP_TREE / TOTAL_KB / N ──────
+scan() {
+    build_protect_set
+    REAPED_REPORT=""
+    REAP_TREE=""
+    TOTAL_KB=0
+    N=0
+    local SEEN_SIDS=" "
+    local NOW; NOW=$(date +%s)
+
+    local pid etime rss args
+    while read -r pid etime rss args; do
+        [ -z "${pid:-}" ] && continue
+        case "$args" in *"$SESSION_MATCH"*) : ;; *) continue ;; esac
+        case "$args" in *"$SELF_NAME"*) continue ;; esac          # never ourselves
+        [ -n "$WORKER_MATCH" ] && { case "$args" in *"$WORKER_MATCH"*) : ;; *) continue ;; esac; }
+        is_protected "$pid" && continue
+        [ "$pid" = "$CUR_SESSION" ] && continue
+
+        local age; age=$(etime_to_sec "$etime")
+        [ "$age" -lt "$GRACE_SECS" ] && continue                  # too young
+
+        local sid; sid=$(extract_sid "$args")
+        [ -z "$sid" ] && continue                                 # can't identify → fail-safe
+        case "$SEEN_SIDS" in *" $sid "*) continue ;; esac         # dedupe parent/child
+        SEEN_SIDS="${SEEN_SIDS}${sid} "
+
+        local transcript; transcript=$(find_transcript "$sid")
+        [ -z "$transcript" ] && continue                          # can't locate → fail-safe
+        local last; last=$(last_activity_epoch "$transcript")
+        [ -z "$last" ] && continue                                # can't parse → fail-safe
+        local idle=$(( NOW - last ))
+
+        # Eligible if idle past the window OR (optional) over the RSS ceiling.
+        local eligible=0
+        [ "$idle" -ge "$IDLE_SECS" ] && eligible=1
+        [ -n "$MAX_RSS_KB" ] && [ "$rss" -ge "$MAX_RSS_KB" ] && eligible=1
+        [ "$eligible" -eq 0 ] && continue
+
+        has_busy_descendant "$pid" && continue                    # building → working
+        subtree_cpu_busy "$pid" && continue                       # burning CPU now → working
+        if [ -n "$SPARE_HOOK" ]; then
+            "$SPARE_HOOK" "$pid" "$sid" "$transcript" >/dev/null 2>&1 && continue
+        fi
+
+        # Survivor: a genuinely parked, idle, non-working session.
+        N=$(( N + 1 ))
+        TOTAL_KB=$(( TOTAL_KB + rss ))
+        local tid line; tid=$(basename "$transcript" .jsonl)
+        REAP_TREE="$REAP_TREE $(subtree_pids "$pid")"
+        line="  pid $pid  $(( rss/1024 ))MB  idle $(human_idle "$idle")  resume: claude --resume $tid"
+        REAPED_REPORT="${REAPED_REPORT}${line}
+"
+    done < <(ps -eo pid=,etime=,rss=,command= 2>/dev/null)
+}
+
+log_findings() {
+    local mode_tag="$1"
+    mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null || true
+    {
+        printf '[%s] [%s] %s parked session(s), ~%sMB (idle>%sh)\n' \
+            "$(date '+%Y-%m-%d %H:%M')" "$mode_tag" "$N" "$(( TOTAL_KB/1024 ))" "$IDLE_HOURS"
+        printf '%s' "$REAPED_REPORT"
+    } >> "$LOG_FILE" 2>/dev/null || true
+}
+
+print_scan_header() {
+    say ""
+    say "  claude-reaper — $(date '+%Y-%m-%d %H:%M')   (idle > ${IDLE_HOURS}h${MAX_RSS:+, or > $MAX_RSS})"
+    say "  $1"
+    say "  ────────────────────────────────────────────────────────"
+}
+
+# ── Subcommands ─────────────────────────────────────────────────
+cmd_status() {
+    scan
+    print_scan_header "mode: status (read-only)"
+    if [ "$N" -eq 0 ]; then
+        say "  Nothing parked — no idle, non-working sessions."
+        return 0
+    fi
+    printf '%s' "$REAPED_REPORT"
+    say "  ────────────────────────────────────────────────────────"
+    say "  $N parked session(s)  ≈ $(( TOTAL_KB/1024 )) MB reclaimable"
+    say "  (run 'claude-reaper reap' to reclaim — recoverable via claude --resume)"
+}
+
+cmd_reap() {
+    scan
+    local killing=1
+    [ "$DRY_RUN" -eq 1 ] && killing=0
+    print_scan_header "$([ "$killing" -eq 1 ] && echo 'mode: REAP' || echo 'mode: dry-run')"
+    if [ "$N" -eq 0 ]; then
+        say "  Nothing to reap."
+        return 0
+    fi
+    printf '%s' "$REAPED_REPORT"
+    say "  ────────────────────────────────────────────────────────"
+    say "  $N parked session(s)  ≈ $(( TOTAL_KB/1024 )) MB"
+
+    log_findings "$([ "$killing" -eq 1 ] && echo KILL || echo DRY)"
+
+    if [ "$killing" -eq 0 ]; then
+        say "  (dry-run — logged to $LOG_FILE)"
+        return 0
+    fi
+
+    # SIGTERM (let handlers run), pause, then SIGKILL survivors.
+    local pid
+    for pid in $REAP_TREE; do kill -TERM "$pid" 2>/dev/null || true; done
+    sleep 2
+    for pid in $REAP_TREE; do kill -0 "$pid" 2>/dev/null && kill -KILL "$pid" 2>/dev/null || true; done
+
+    local summary="Reaped $N idle Claude session(s), ~$(( TOTAL_KB/1024 ))MB freed (idle>${IDLE_HOURS}h). Recoverable via claude --resume."
+    say "  $summary"
+    notify "$summary"
+}
+
+# Fire the notify hook / command, best-effort. Summary + per-session report on stdin.
+notify() {
+    local payload="$1
+$REAPED_REPORT"
+    if [ -n "$NOTIFY_HOOK" ]; then
+        printf '%s' "$payload" | "$NOTIFY_HOOK" >/dev/null 2>&1 || true
+    elif [ -n "$NOTIFY_CMD" ]; then
+        printf '%s' "$payload" | sh -c "$NOTIFY_CMD" >/dev/null 2>&1 || true
+    fi
+}
+
+cmd_logs() {
+    [ -f "$LOG_FILE" ] || die "No log yet at $LOG_FILE"
+    if [ "${1:-}" = "-f" ]; then tail -f "$LOG_FILE"; else tail -n 40 "$LOG_FILE"; fi
+}
+
+cmd_config() {
+    case "${1:-}" in
+        --path) printf '%s\n' "${CONFIG_FILE:-${CLAUDE_REAPER_CONFIG:-$DEFAULT_CONFIG}}"; return 0 ;;
+        --init)
+            local f="${CONFIG_FILE:-${CLAUDE_REAPER_CONFIG:-$DEFAULT_CONFIG}}"
+            [ -f "$f" ] && die "Config already exists at $f"
+            mkdir -p "$(dirname "$f")"
+            write_config_example > "$f"
+            say "Wrote starter config to $f"
+            return 0 ;;
+    esac
+    say "Effective config${LOADED_CONFIG:+  (loaded: $LOADED_CONFIG)}:"
+    printf '  %-20s %s\n' \
+        IDLE_HOURS "$IDLE_HOURS" \
+        GRACE_MINS "$GRACE_MINS" \
+        CPU_WINDOW_SECS "$CPU_WINDOW_SECS" \
+        SCHED_INTERVAL "$SCHED_INTERVAL" \
+        PROJECTS_DIR "$PROJECTS_DIR" \
+        LOG_FILE "$LOG_FILE" \
+        SESSION_MATCH "$SESSION_MATCH" \
+        SESSION_ID_PATTERNS "$SESSION_ID_PATTERNS" \
+        WORKER_MATCH "${WORKER_MATCH:-(none)}" \
+        MAX_RSS "${MAX_RSS:-(off)}" \
+        SPARE_HOOK "${SPARE_HOOK:-(none)}" \
+        NOTIFY_HOOK "${NOTIFY_HOOK:-(none)}" \
+        NOTIFY_CMD "${NOTIFY_CMD:-(none)}"
+    printf '  %-20s %s\n' BUSY_PROCS "$BUSY_RE"
+}
+
+# ── Scheduler install/uninstall (launchd on macOS, systemd --user on Linux) ──
+self_path() {
+    local s="$0"
+    [ -L "$s" ] && s="$(readlink "$s")"
+    case "$s" in /*) printf '%s\n' "$s" ;; *) printf '%s\n' "$(cd "$(dirname "$0")" && pwd)/$(basename "$s")" ;; esac
+}
+
+LAUNCHD_LABEL="com.claude-reaper.reap"
+LAUNCHD_PLIST="$HOME/Library/LaunchAgents/$LAUNCHD_LABEL.plist"
+SYSTEMD_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+
+cmd_install() {
+    local sp; sp="$(self_path)"
+    mkdir -p "$STATE_DIR"
+    if [ "$OS" = "Darwin" ]; then
+        mkdir -p "$(dirname "$LAUNCHD_PLIST")"
+        cat > "$LAUNCHD_PLIST" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>$LAUNCHD_LABEL</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>$sp</string>
+        <string>--quiet</string>
+        <string>reap</string>
+    </array>
+    <key>StartInterval</key><integer>$SCHED_INTERVAL</integer>
+    <key>RunAtLoad</key><true/>
+    <key>StandardOutPath</key><string>$STATE_DIR/launchd.out.log</string>
+    <key>StandardErrorPath</key><string>$STATE_DIR/launchd.err.log</string>
+</dict>
+</plist>
+PLIST
+        launchctl bootout "gui/$(id -u)" "$LAUNCHD_PLIST" 2>/dev/null || true
+        launchctl bootstrap "gui/$(id -u)" "$LAUNCHD_PLIST" \
+            && say "Installed launchd agent → reaps every $(( SCHED_INTERVAL/60 ))min ($LAUNCHD_PLIST)" \
+            || die "launchctl bootstrap failed"
+    elif [ "$OS" = "Linux" ]; then
+        command -v systemctl >/dev/null 2>&1 || die "systemd not found — install a cron entry manually: */$(( SCHED_INTERVAL/60 )) * * * * $sp --quiet reap"
+        mkdir -p "$SYSTEMD_DIR"
+        cat > "$SYSTEMD_DIR/claude-reaper.service" <<UNIT
+[Unit]
+Description=Reap parked idle Claude Code sessions
+
+[Service]
+Type=oneshot
+ExecStart=$sp --quiet reap
+UNIT
+        cat > "$SYSTEMD_DIR/claude-reaper.timer" <<UNIT
+[Unit]
+Description=Periodic claude-reaper
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=${SCHED_INTERVAL}s
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+UNIT
+        systemctl --user daemon-reload
+        systemctl --user enable --now claude-reaper.timer \
+            && say "Installed systemd --user timer → reaps every $(( SCHED_INTERVAL/60 ))min" \
+            || die "systemctl enable failed (is the user instance running? try 'loginctl enable-linger $USER')"
+    else
+        die "Unsupported OS: $OS (macOS + Linux only)"
+    fi
+}
+
+cmd_uninstall() {
+    if [ "$OS" = "Darwin" ]; then
+        launchctl bootout "gui/$(id -u)" "$LAUNCHD_PLIST" 2>/dev/null || true
+        rm -f "$LAUNCHD_PLIST" && say "Removed launchd agent."
+    elif [ "$OS" = "Linux" ]; then
+        systemctl --user disable --now claude-reaper.timer 2>/dev/null || true
+        rm -f "$SYSTEMD_DIR/claude-reaper.timer" "$SYSTEMD_DIR/claude-reaper.service"
+        systemctl --user daemon-reload 2>/dev/null || true
+        say "Removed systemd timer."
+    else
+        die "Unsupported OS: $OS"
+    fi
+}
+
+usage() {
+    sed -n '2,/^$/p' "$(self_path)" 2>/dev/null | sed 's/^#\{0,1\} \{0,1\}//'
+}
+
+write_config_example() {
+    cat <<'CFG'
+# claude-reaper config — every key is optional; uncomment to override a default.
+# Plain shell, sourced by the tool. Flags override these.
+
+# IDLE_HOURS=3                 # reap sessions idle longer than this
+# GRACE_MINS=30                # never touch a session younger than this
+# CPU_WINDOW_SECS=4            # CPU-sampling window for the "is it working?" check
+# SCHED_INTERVAL=7200          # scheduler period in seconds (install)
+# PROJECTS_DIR="$HOME/.claude/projects"
+# LOG_FILE="$HOME/.local/state/claude-reaper/reaper.log"
+
+# How a session worker is recognised on its command line:
+# SESSION_MATCH='share/claude/versions'   # native installer path. npm installs differ.
+# SESSION_ID_PATTERNS='both'              # uuid | cse | both  (cse = remote-control)
+# WORKER_MATCH=''                         # optional extra cmdline substring filter
+#                                         #   e.g. '--print' to scope to print-mode workers
+
+# Also reap parked sessions over this RSS even if not past the idle window:
+# MAX_RSS=4G
+
+# Extend (recommended) or replace the "actively building → spare" process set:
+# BUSY_PROCS_EXTRA='bazel|buck2|tup'
+# BUSY_PROCS='only|these|exact|tools'     # advanced: replaces the safe default
+
+# Notification after a reap (summary + per-session report arrive on stdin).
+# Prefer a hook at ~/.config/claude-reaper/hooks/notify; or a one-liner here:
+# NOTIFY_CMD='cat >> ~/reaper-events.txt'
+CFG
+}
+
+# ── Dispatch ────────────────────────────────────────────────────
+main() {
+    local SUBCMD="" ARGS=()
+    local FLAG_IDLE='' FLAG_GRACE='' FLAG_CPU='' FLAG_MAXRSS='' FLAG_INTERVAL=''
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            status|reap|install|uninstall|logs|config) [ -z "$SUBCMD" ] && SUBCMD="$1" || ARGS+=("$1"); shift ;;
+            --idle-hours)  FLAG_IDLE="$2"; shift 2 ;;
+            --idle-hours=*) FLAG_IDLE="${1#*=}"; shift ;;
+            --grace-mins)  FLAG_GRACE="$2"; shift 2 ;;
+            --grace-mins=*) FLAG_GRACE="${1#*=}"; shift ;;
+            --cpu-window)  FLAG_CPU="$2"; shift 2 ;;
+            --cpu-window=*) FLAG_CPU="${1#*=}"; shift ;;
+            --max-rss)     FLAG_MAXRSS="$2"; shift 2 ;;
+            --max-rss=*)   FLAG_MAXRSS="${1#*=}"; shift ;;
+            --interval)    FLAG_INTERVAL="$2"; shift 2 ;;
+            --interval=*)  FLAG_INTERVAL="${1#*=}"; shift ;;
+            --config)      CONFIG_FILE="$2"; shift 2 ;;
+            --config=*)    CONFIG_FILE="${1#*=}"; shift ;;
+            --quiet)       QUIET=1; shift ;;
+            --dry-run)     DRY_RUN=1; shift ;;
+            -h|--help)     SUBCMD="help"; shift ;;
+            --version|-V)  printf 'claude-reaper %s\n' "$VERSION"; return 0 ;;
+            *)             ARGS+=("$1"); shift ;;
+        esac
+    done
+    [ -z "$SUBCMD" ] && SUBCMD="status"
+
+    load_config
+    # Flags override config + built-ins, then recompute derived values.
+    [ -n "$FLAG_IDLE" ]     && IDLE_HOURS="$FLAG_IDLE"
+    [ -n "$FLAG_GRACE" ]    && GRACE_MINS="$FLAG_GRACE"
+    [ -n "$FLAG_CPU" ]      && CPU_WINDOW_SECS="$FLAG_CPU"
+    [ -n "$FLAG_MAXRSS" ]   && MAX_RSS="$FLAG_MAXRSS"
+    [ -n "$FLAG_INTERVAL" ] && SCHED_INTERVAL="$FLAG_INTERVAL"
+    IDLE_SECS=$(( IDLE_HOURS * 3600 ))
+    GRACE_SECS=$(( GRACE_MINS * 60 ))
+    [ -n "$MAX_RSS" ] && MAX_RSS_KB="$(rss_to_kb "$MAX_RSS")"
+
+    case "$SUBCMD" in
+        status)    cmd_status ;;
+        reap)      cmd_reap ;;
+        install)   cmd_install ;;
+        uninstall) cmd_uninstall ;;
+        logs)      cmd_logs "${ARGS[@]:-}" ;;
+        config)    cmd_config "${ARGS[@]:-}" ;;
+        help)      usage ;;
+        *)         die "Unknown command: $SUBCMD (try --help)" ;;
+    esac
+}
+
+# Sourceable for tests; runs only when executed directly.
+if [ "${BASH_SOURCE[0]:-}" = "${0}" ]; then
+    main "$@"
+fi

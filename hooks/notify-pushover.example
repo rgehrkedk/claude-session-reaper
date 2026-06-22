@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# notify hook — fired after a reap actually kills something. Best-effort.
+#
+# Install to: ~/.config/claude-reaper/hooks/notify   (chmod +x)
+#
+# The summary line + per-session report arrive on STDIN. Do whatever you like
+# with them — Pushover, ntfy, Slack, a desktop banner, append to a file.
+
+msg="$(cat)"
+
+# ── Pushover ────────────────────────────────────────────────────
+# Set these in your environment (or inline them here):
+: "${PUSHOVER_TOKEN:?set PUSHOVER_TOKEN}"
+: "${PUSHOVER_USER:?set PUSHOVER_USER}"
+
+curl -s --max-time 10 \
+    -F "token=$PUSHOVER_TOKEN" \
+    -F "user=$PUSHOVER_USER" \
+    -F "title=claude-reaper" \
+    -F "message=$msg" \
+    https://api.pushover.net/1/messages.json >/dev/null 2>&1 || true
+
+# ── Alternatives (swap in whichever you use) ────────────────────
+# ntfy:    curl -s -d "$msg" https://ntfy.sh/your-topic >/dev/null 2>&1 || true
+# Slack:   curl -s -X POST -H 'Content-type: application/json' \
+#              --data "{\"text\":\"$msg\"}" "$SLACK_WEBHOOK_URL" >/dev/null 2>&1 || true
+# macOS:   osascript -e "display notification \"$msg\" with title \"claude-reaper\""

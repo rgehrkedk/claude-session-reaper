@@ -1,0 +1,4 @@
+# local config / state — never commit a personal setup
+config
+*.log
+.DS_Store

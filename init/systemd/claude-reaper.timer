@@ -1,0 +1,11 @@
+# Pairs with claude-reaper.service. Fires 10min after boot, then every 2h.
+[Unit]
+Description=Periodic claude-reaper
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=7200s
+Persistent=true
+
+[Install]
+WantedBy=timers.target

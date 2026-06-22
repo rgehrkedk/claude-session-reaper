@@ -1,0 +1,51 @@
+# claude-reaper config — every key is optional; uncomment to override a default.
+# Plain shell, sourced by the tool. Command-line flags override these.
+#
+# Install to: ~/.config/claude-reaper/config   (or `claude-reaper config --init`)
+
+# ── Timing ──────────────────────────────────────────────────────
+# IDLE_HOURS=3                 # reap sessions idle longer than this
+# GRACE_MINS=30                # never touch a session younger than this
+# CPU_WINDOW_SECS=4            # CPU-sampling window for the "is it working?" check
+# SCHED_INTERVAL=7200          # scheduler period in seconds (used by `install`)
+
+# ── Paths ───────────────────────────────────────────────────────
+# PROJECTS_DIR="$HOME/.claude/projects"   # respects $CLAUDE_CONFIG_DIR
+# LOG_FILE="$HOME/.local/state/claude-reaper/reaper.log"
+
+# ── Session identification ──────────────────────────────────────
+# How a Claude session worker is recognised on its command line.
+# Default targets the native installer (~/.local/share/claude/versions/...).
+# npm / other installs differ — adjust if `claude-reaper status` finds nothing.
+# SESSION_MATCH='share/claude/versions'
+#
+# Which session-id shapes to look for:
+#   uuid  — standard local sessions (<uuid>.jsonl)
+#   cse   — remote-control sessions (cse_… ids)
+#   both  — try both (default; the unused branch simply finds nothing)
+# SESSION_ID_PATTERNS='both'
+#
+# Optional extra command-line substring a worker must contain to be eligible.
+# Empty matches interactive + print-mode. Set '--print' to scope to print/
+# remote-control workers only (this is the original author's setup).
+# WORKER_MATCH=''
+
+# ── Memory ceiling (optional second trigger) ────────────────────
+# Also reap parked sessions whose RSS exceeds this, even if not past the idle
+# window. Useful on Linux, where idle sessions can climb toward OOM.
+# MAX_RSS=4G
+
+# ── "Actively working → spare" process set ──────────────────────
+# A session with any of these as a live descendant is left alone.
+# Recommended: APPEND your build tools, keeping the safe default.
+# BUSY_PROCS_EXTRA='bazel|buck2|tup'
+#
+# Advanced: replace the default entirely (you own the risk of a too-narrow set).
+# Example — the original Xcode/iOS author's set:
+# BUSY_PROCS='xcodebuild|swift-frontend|swiftc|/clang|xctest| ld |swift test'
+
+# ── Notification after a reap ───────────────────────────────────
+# Summary + per-session report arrive on stdin. Prefer an executable hook at
+# ~/.config/claude-reaper/hooks/notify (see hooks/notify-pushover.example).
+# Or a one-liner here:
+# NOTIFY_CMD='cat >> ~/reaper-events.log'

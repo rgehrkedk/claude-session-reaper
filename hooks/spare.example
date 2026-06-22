@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# spare hook — veto a reap with custom logic the core doesn't know about.
+#
+# Install to: ~/.config/claude-reaper/hooks/spare   (chmod +x)
+#
+# Called once per reap candidate, AFTER all built-in safety spares have passed:
+#   $1 = pid            the session's root process id
+#   $2 = session_id     uuid or cse_ id
+#   $3 = transcript     path to the session's .jsonl
+#
+# Exit 0  → SPARE this session (do not kill it)
+# Exit !0 → eligible (the built-in checks already cleared it)
+#
+# This can only ADD protection — it can never force a kill the core wouldn't make.
+
+pid="$1"; session_id="$2"; transcript="$3"
+
+# Example 1 — never reap a session whose transcript path is under a "keep" project:
+case "$transcript" in
+    *"/keep-alive/"*) exit 0 ;;
+esac
+
+# Example 2 — spare anything still holding a lock file you care about:
+# [ -e "/tmp/my-long-job.lock" ] && exit 0
+
+# Example 3 — spare sessions tagged in an allowlist file (one id per line):
+# grep -qxF "$session_id" "$HOME/.config/claude-reaper/keep.txt" 2>/dev/null && exit 0
+
+exit 1

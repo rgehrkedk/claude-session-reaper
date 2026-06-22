@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Reference copy. `claude-reaper install` writes this for you (with real paths).
+  Manual install:
+    cp this to ~/Library/LaunchAgents/com.claude-reaper.reap.plist
+    edit the <string> path to your claude-reaper, then:
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.claude-reaper.reap.plist
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>com.claude-reaper.reap</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/REPLACE/WITH/PATH/TO/claude-reaper</string>
+        <string>--quiet</string>
+        <string>reap</string>
+    </array>
+    <!-- Every 2 hours -->
+    <key>StartInterval</key><integer>7200</integer>
+    <key>RunAtLoad</key><true/>
+    <key>StandardOutPath</key><string>/tmp/claude-reaper.out.log</string>
+    <key>StandardErrorPath</key><string>/tmp/claude-reaper.err.log</string>
+</dict>
+</plist>
