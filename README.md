@@ -15,6 +15,29 @@ process, not the idle one, with no recoverability.
 
 `claude-reaper` is the careful version.
 
+## What it does
+
+- Finds running Claude Code session processes and the RAM they hold.
+- Reaps **only** ones that are idle past a threshold **and** provably not working.
+- Leaves every conversation resumable — kills the process, never the transcript.
+- Runs on a schedule if you want it to (launchd on macOS, systemd on Linux).
+- Stays out of the way: configurable thresholds, `spare`/`notify` hooks.
+
+## What it does NOT do
+
+- **Does not kill a session that's working** — building, recently active, under
+  the grace age, or burning CPU right now. Those are spared, always.
+- **Does not delete transcripts or any on-disk data.** It frees memory, not disk.
+  (Want disk cleanup? That's a different tool — see *Neighbors* below.)
+- **Does not hunt orphaned subagents/MCP ghosts by terminal.** It targets parked
+  top-level sessions, not crashed children. (Again — *Neighbors*.)
+- **Does not run on native Windows.** Use WSL, where it's just Linux.
+- **Does not recover the live phone/web connection** — only the conversation.
+  You re-attach with `claude --resume`.
+- **Does not run a daemon of its own.** No background service beyond the optional
+  scheduler entry you install.
+- **Is not a session browser or TUI.** One job: reclaim RAM, safely.
+
 ## Why it won't eat your work
 
 The Desktop app's idle handling kills sessions on a wall-clock
@@ -98,6 +121,19 @@ nothing on your setup, your install lays processes out differently; set
 `SESSION_MATCH` / `WORKER_MATCH` to match, or open an issue with a line of
 `ps -eo pid,command | grep claude`. The fail-safe design means an unrecognised
 session is skipped, never wrongly killed.
+
+## Neighbors
+
+Different jobs, not competitors — you can run them alongside this:
+
+- **[cleanup-claude-sessions](https://github.com/Westiger031/cleanup-claude-sessions)**
+  kills *orphaned* Claude processes (no terminal attached — crashed subagents,
+  stray MCP servers). It uses TTY presence as the only signal, with no
+  idle/working check, so it's aimed at ghosts, not parked-but-alive sessions.
+  It reaps dead children; this reaps idle parents.
+- **[claude-code-session-manager](https://github.com/KenCheung-AIxFinance/claude-code-session-manager)**
+  manages *on-disk* session data — list/inspect/delete transcripts, todos, env,
+  history. Frees disk, not RAM. Doesn't touch processes.
 
 ## License
 
