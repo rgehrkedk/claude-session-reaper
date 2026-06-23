@@ -36,7 +36,10 @@
 # MAX_RSS=4G
 
 # ── "Actively working → spare" process set ──────────────────────
-# A session with any of these as a live descendant is left alone.
+# A session with any of these as a live descendant is left alone. The default
+# already covers compilers, test runners, bundlers, dev servers, and IaC.
+# NOTE: bare node/npm/bun are deliberately excluded — they'd make every session
+# with an MCP-server child immortal. Add specific tool names, not runtimes.
 # Recommended: APPEND your build tools, keeping the safe default.
 # BUSY_PROCS_EXTRA='bazel|buck2|tup'
 #
