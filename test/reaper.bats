@@ -63,6 +63,35 @@ setup() {
     [ -z "$output" ]
 }
 
+@test "json_escape escapes quotes and backslashes" {
+    run json_escape 'a"b\c'
+    [ "$output" = 'a\"b\\c' ]
+}
+
+@test "reason_human maps a known token" {
+    run reason_human recently_active
+    [ "$output" = "active within the idle window" ]
+}
+
+@test "reason_human passes through an unknown token" {
+    run reason_human some_future_reason
+    [ "$output" = "some_future_reason" ]
+}
+
+@test "add_record preserves empty fields (US separator, not tab)" {
+    RECORDS=""
+    add_record keep 123 "" 4096 5000 "" "" protected_current_session
+    local decision pid sid rss age idle transcript reason
+    IFS=$'\037' read -r decision pid sid rss age idle transcript reason <<< "$RECORDS"
+    [ "$decision" = "keep" ]
+    [ "$pid" = "123" ]
+    [ -z "$sid" ]
+    [ "$rss" = "4096" ]
+    [ -z "$idle" ]
+    [ -z "$transcript" ]
+    [ "$reason" = "protected_current_session" ]
+}
+
 @test "iso_to_epoch round-trips a known UTC timestamp" {
     # 2026-01-02T03:04:05Z == 1767322Z... compute via the same date binary.
     if date --version >/dev/null 2>&1; then

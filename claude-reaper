@@ -18,6 +18,8 @@
 # Default subcommand is `status` (read-only). `reap` does the killing. macOS + Linux.
 #
 #   claude-reaper                 show what WOULD be reaped (safe, read-only)
+#   claude-reaper status --explain  show EVERY session and why it's kept/reaped/skipped
+#   claude-reaper status --json   machine-readable decision report
 #   claude-reaper reap            reap idle parked sessions (recoverable via --resume)
 #   claude-reaper reap --dry-run  scan only, never kill
 #   claude-reaper install         install the periodic scheduler (launchd/systemd)
@@ -29,7 +31,7 @@
 # NOT `set -e`: a failed kill must never abort the run.
 set -uo pipefail
 
-VERSION="0.1.0"
+VERSION="0.2.0"
 SELF_NAME="claude-reaper"
 
 # ── Paths (XDG, overridable by env/config) ──────────────────────
@@ -54,14 +56,16 @@ NOTIFY_HOOK=''                                        # executable; fed summary 
 BUSY_PROCS=''                                         # replace the busy default entirely
 BUSY_PROCS_EXTRA=''                                   # append to the busy default
 
-# Descendants that mean "this session is actively working — spare it". Compiled
-# builds and test runs only — deliberately NOT bare `node`, or every session with
-# an MCP server child would be immortal.
-BUSY_PROCS_DEFAULT='xcodebuild|swift-frontend|swiftc|/clang|clang\+\+|cc1|cc1plus|xctest|swift test| ld |/gcc|/g\+\+|cargo|rustc|go build|make|cmake|ninja|gradle|mvn|webpack|vite|esbuild|rollup|pytest|jest|tsc'
+# Descendants that mean "this session is actively working — spare it". Compilers,
+# test runners, bundlers, dev servers, IaC. Deliberately NOT bare `node`/`npm`/
+# `bun` — those would make every session with an MCP-server child immortal.
+BUSY_PROCS_DEFAULT='xcodebuild|swift-frontend|swiftc|/clang|clang\+\+|cc1|cc1plus|xctest|swift test| ld |/gcc|/g\+\+|cargo|rustc|rust-analyzer|go build|go test|make|cmake|ninja|bazel|buck2|gradle|mvn|kotlinc|webpack|vite|esbuild|rollup|parcel|next dev|nuxt|astro|storybook|tsc|pytest|jest|mocha|vitest|ruff|mypy|manage.py|terraform|pulumi|docker build|docker compose|docker-compose'
 
 # ── Runtime flags ───────────────────────────────────────────────
 QUIET=0
 DRY_RUN=0
+EXPLAIN=0
+JSON=0
 CONFIG_FILE=''
 
 say() { [ "$QUIET" -eq 1 ] && return 0; printf '%s\n' "$*"; }
@@ -115,6 +119,28 @@ rss_to_kb() {
 
 human_idle() { printf '%dh%02dm' $(( $1/3600 )) $(( ($1%3600)/60 )); }
 
+# Escape a string for embedding in JSON (backslash + double-quote; no control chars expected).
+json_escape() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
+
+# Decision-reason token → human sentence (for --explain).
+reason_human() {
+    case "$1" in
+        protected_current_session) echo "this session / protected" ;;
+        too_young)                 echo "younger than grace (${GRACE_MINS}m)" ;;
+        recently_active)           echo "active within the idle window" ;;
+        busy_descendant)           echo "live build/test descendant" ;;
+        cpu_active)                echo "CPU rose during sample" ;;
+        spare_hook)                echo "spared by hook" ;;
+        no_session_id)             echo "no session id on command line" ;;
+        transcript_not_found)      echo "transcript not found" ;;
+        transcript_unparsed)       echo "transcript timestamp unparseable" ;;
+        no_session_match)          echo "has --session-id but didn't match SESSION_MATCH (adjust config?)" ;;
+        idle_and_not_busy)         echo "idle, no CPU, no busy descendants" ;;
+        over_rss_ceiling)          echo "over MAX_RSS ceiling, not working" ;;
+        *)                         echo "$1" ;;
+    esac
+}
+
 # ── Config resolution: flags > $CONFIG_FILE/env > default file > built-ins ──
 load_config() {
     local f="${CONFIG_FILE:-${CLAUDE_REAPER_CONFIG:-$DEFAULT_CONFIG}}"
@@ -124,10 +150,8 @@ load_config() {
         . "$f"
         LOADED_CONFIG="$f"
     fi
-    # Hooks: explicit path wins, else discover in the config dir.
     [ -z "$SPARE_HOOK" ]  && [ -x "$CONFIG_HOME/hooks/spare" ]  && SPARE_HOOK="$CONFIG_HOME/hooks/spare"
     [ -z "$NOTIFY_HOOK" ] && [ -x "$CONFIG_HOME/hooks/notify" ] && NOTIFY_HOOK="$CONFIG_HOME/hooks/notify"
-    # Compose the busy-process regex.
     local base="${BUSY_PROCS:-$BUSY_PROCS_DEFAULT}"
     [ -n "$BUSY_PROCS_EXTRA" ] && base="$base|$BUSY_PROCS_EXTRA"
     BUSY_RE="$base"
@@ -152,7 +176,6 @@ subtree_pids() {
     echo "$out"
 }
 
-# A live build/test descendant = real work → spare.
 has_busy_descendant() {
     local pids p cargs
     pids="$(subtree_pids "$1")"
@@ -165,8 +188,7 @@ has_busy_descendant() {
 }
 
 # Is the subtree burning CPU right now? Final, misclassification-free check that a
-# stale-looking session isn't mid-work (LLM turn, long compute). Samples cumulative
-# CPU across a short window.
+# stale-looking session isn't mid-work. Samples cumulative CPU across a short window.
 subtree_cpu_busy() {
     local pids p s1=0 s2=0
     pids="$(subtree_pids "$1")"
@@ -198,8 +220,7 @@ find_transcript() {
     grep -lF "$sid" "$PROJECTS_DIR"/*/*.jsonl 2>/dev/null | head -1
 }
 
-# True last activity = last message timestamp INSIDE the transcript, not file mtime
-# (mtime gets bumped by lifecycle writes and would mask a parked session as recent).
+# True last activity = last message timestamp INSIDE the transcript, not file mtime.
 last_activity_epoch() {
     local ts
     ts=$(grep -oE '"timestamp":"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}' "$1" 2>/dev/null \
@@ -212,12 +233,14 @@ last_activity_epoch() {
 build_protect_set() {
     PROTECT=" "
     CUR_SESSION=""
-    local _p=$$
+    CUR_SID=""
+    local _p=$$ _cmd
     while [ "$_p" -gt 1 ]; do
         PROTECT="${PROTECT}${_p} "
+        _cmd="$(ps -o command= -p "$_p" 2>/dev/null)"
         if [ -z "$CUR_SESSION" ]; then
-            case "$(ps -o command= -p "$_p" 2>/dev/null)" in
-                *"$SESSION_MATCH"*) CUR_SESSION="$_p" ;;
+            case "$_cmd" in
+                *"$SESSION_MATCH"*) CUR_SESSION="$_p"; CUR_SID="$(extract_sid "$_cmd")" ;;
             esac
         fi
         _p=$(ps -o ppid= -p "$_p" 2>/dev/null | tr -d ' ')
@@ -226,10 +249,19 @@ build_protect_set() {
 }
 is_protected() { case "$PROTECT" in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
 
-# ── Scan: populate REAPED_REPORT / REAP_TREE / TOTAL_KB / N ──────
+# Append a decision record: decision pid sid rss_kb age idle transcript reason.
+# Fields are separated by US (0x1f), a NON-whitespace byte — so empty fields are
+# preserved by `read` (tab/space would collapse, shifting columns).
+add_record() {
+    RECORDS+=$(printf '%s\037%s\037%s\037%s\037%s\037%s\037%s\037%s' "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$8")
+    RECORDS+=$'\n'
+}
+
+# ── Scan: classify every candidate into RECORDS; tally REAP_TREE/TOTAL_KB/N ──
+# Gate order is cheapest-first so the 4s CPU sample only runs on would-be reaps.
 scan() {
     build_protect_set
-    REAPED_REPORT=""
+    RECORDS=""
     REAP_TREE=""
     TOTAL_KB=0
     N=0
@@ -239,47 +271,128 @@ scan() {
     local pid etime rss args
     while read -r pid etime rss args; do
         [ -z "${pid:-}" ] && continue
-        case "$args" in *"$SESSION_MATCH"*) : ;; *) continue ;; esac
         case "$args" in *"$SELF_NAME"*) continue ;; esac          # never ourselves
+
+        case "$args" in
+            *"$SESSION_MATCH"*) : ;;
+            # Diagnostic: a real session from an install we don't match (explain/json only).
+            *--session-id*) add_record skip "$pid" "" "$rss" "" "" "" no_session_match; continue ;;
+            *) continue ;;
+        esac
+
         [ -n "$WORKER_MATCH" ] && { case "$args" in *"$WORKER_MATCH"*) : ;; *) continue ;; esac; }
-        is_protected "$pid" && continue
-        [ "$pid" = "$CUR_SESSION" ] && continue
 
-        local age; age=$(etime_to_sec "$etime")
-        [ "$age" -lt "$GRACE_SECS" ] && continue                  # too young
+        local age sid
+        age=$(etime_to_sec "$etime")
+        sid=$(extract_sid "$args")
 
-        local sid; sid=$(extract_sid "$args")
-        [ -z "$sid" ] && continue                                 # can't identify → fail-safe
-        case "$SEEN_SIDS" in *" $sid "*) continue ;; esac         # dedupe parent/child
+        # Protect the whole current session by id (remote-control workers are PPID-detached).
+        if is_protected "$pid" || [ "$pid" = "$CUR_SESSION" ] || { [ -n "$sid" ] && [ "$sid" = "$CUR_SID" ]; }; then
+            case "$SEEN_SIDS" in *" $sid "*) continue ;; esac
+            [ -n "$sid" ] && SEEN_SIDS="${SEEN_SIDS}${sid} "
+            add_record keep "$pid" "$sid" "$rss" "$age" "" "" protected_current_session
+            continue
+        fi
+        if [ -z "$sid" ]; then
+            add_record skip "$pid" "" "$rss" "$age" "" "" no_session_id; continue
+        fi
+        case "$SEEN_SIDS" in *" $sid "*) continue ;; esac          # dedupe child workers
         SEEN_SIDS="${SEEN_SIDS}${sid} "
 
+        if [ "$age" -lt "$GRACE_SECS" ]; then
+            add_record keep "$pid" "$sid" "$rss" "$age" "" "" too_young; continue
+        fi
         local transcript; transcript=$(find_transcript "$sid")
-        [ -z "$transcript" ] && continue                          # can't locate → fail-safe
+        if [ -z "$transcript" ]; then
+            add_record skip "$pid" "$sid" "$rss" "$age" "" "" transcript_not_found; continue
+        fi
         local last; last=$(last_activity_epoch "$transcript")
-        [ -z "$last" ] && continue                                # can't parse → fail-safe
+        if [ -z "$last" ]; then
+            add_record skip "$pid" "$sid" "$rss" "$age" "" "$transcript" transcript_unparsed; continue
+        fi
         local idle=$(( NOW - last ))
 
-        # Eligible if idle past the window OR (optional) over the RSS ceiling.
-        local eligible=0
+        local eligible=0 reason=idle_and_not_busy
         [ "$idle" -ge "$IDLE_SECS" ] && eligible=1
-        [ -n "$MAX_RSS_KB" ] && [ "$rss" -ge "$MAX_RSS_KB" ] && eligible=1
-        [ "$eligible" -eq 0 ] && continue
-
-        has_busy_descendant "$pid" && continue                    # building → working
-        subtree_cpu_busy "$pid" && continue                       # burning CPU now → working
-        if [ -n "$SPARE_HOOK" ]; then
-            "$SPARE_HOOK" "$pid" "$sid" "$transcript" >/dev/null 2>&1 && continue
+        if [ -n "$MAX_RSS_KB" ] && [ "$rss" -ge "$MAX_RSS_KB" ]; then
+            eligible=1
+            [ "$idle" -lt "$IDLE_SECS" ] && reason=over_rss_ceiling
+        fi
+        if [ "$eligible" -eq 0 ]; then
+            add_record keep "$pid" "$sid" "$rss" "$age" "$idle" "$transcript" recently_active; continue
+        fi
+        if has_busy_descendant "$pid"; then
+            add_record keep "$pid" "$sid" "$rss" "$age" "$idle" "$transcript" busy_descendant; continue
+        fi
+        if subtree_cpu_busy "$pid"; then
+            add_record keep "$pid" "$sid" "$rss" "$age" "$idle" "$transcript" cpu_active; continue
+        fi
+        if [ -n "$SPARE_HOOK" ] && "$SPARE_HOOK" "$pid" "$sid" "$transcript" >/dev/null 2>&1; then
+            add_record keep "$pid" "$sid" "$rss" "$age" "$idle" "$transcript" spare_hook; continue
         fi
 
         # Survivor: a genuinely parked, idle, non-working session.
         N=$(( N + 1 ))
         TOTAL_KB=$(( TOTAL_KB + rss ))
-        local tid line; tid=$(basename "$transcript" .jsonl)
         REAP_TREE="$REAP_TREE $(subtree_pids "$pid")"
-        line="  pid $pid  $(( rss/1024 ))MB  idle $(human_idle "$idle")  resume: claude --resume $tid"
-        REAPED_REPORT="${REAPED_REPORT}${line}
-"
+        add_record reap "$pid" "$sid" "$rss" "$age" "$idle" "$transcript" "$reason"
     done < <(ps -eo pid=,etime=,rss=,command= 2>/dev/null)
+}
+
+# ── Output ──────────────────────────────────────────────────────
+# The concise reap lines (default status + reap report + log + notify).
+reap_report() {
+    local decision pid sid rss age idle transcript reason tid
+    while IFS=$'\037' read -r decision pid sid rss age idle transcript reason; do
+        [ "$decision" = "reap" ] || continue
+        tid=$(basename "$transcript" .jsonl)
+        printf '  pid %s  %sMB  idle %s  resume: claude --resume %s\n' \
+            "$pid" "$(( rss/1024 ))" "$(human_idle "$idle")" "$tid"
+    done <<< "$RECORDS"
+}
+
+# The full decision trail (--explain): every candidate, kept/reaped/skipped + why.
+print_explain() {
+    local decision pid sid rss age idle transcript reason
+    while IFS=$'\037' read -r decision pid sid rss age idle transcript reason; do
+        [ -z "$decision" ] && continue
+        local d idlestr sidstr rssstr
+        d=$(printf '%s' "$decision" | tr '[:lower:]' '[:upper:]')
+        idlestr="-"; [ -n "$idle" ] && idlestr="idle $(human_idle "$idle")"
+        sidstr="-"; [ -n "$sid" ] && sidstr="$sid"
+        rssstr="-"; [ -n "$rss" ] && rssstr="$(( rss/1024 ))MB"
+        printf '  %-4s pid %-7s %-8s %-11s %-28s  %s\n' \
+            "$d" "$pid" "$rssstr" "$idlestr" "$sidstr" "$(reason_human "$reason")"
+    done <<< "$RECORDS"
+}
+
+# Machine-readable report (valid JSON only — no decorative output).
+emit_json() {
+    local mode="$1" ts
+    ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    printf '{\n'
+    printf '  "mode": "%s",\n' "$mode"
+    printf '  "timestamp": "%s",\n' "$ts"
+    printf '  "idleHours": %s,\n' "$IDLE_HOURS"
+    printf '  "graceMinutes": %s,\n' "$GRACE_MINS"
+    printf '  "reclaimableMb": %s,\n' "$(( TOTAL_KB/1024 ))"
+    printf '  "sessions": ['
+    local decision pid sid rss age idle transcript reason first=1
+    while IFS=$'\037' read -r decision pid sid rss age idle transcript reason; do
+        [ -z "$decision" ] && continue
+        if [ "$first" -eq 1 ]; then printf '\n'; first=0; else printf ',\n'; fi
+        local idleJson=null rssMb=0 ageJson=0 sidJson=null trJson=null resumeJson=null
+        [ -n "$idle" ] && idleJson="$idle"
+        [ -n "$rss" ]  && rssMb=$(( rss/1024 ))
+        [ -n "$age" ]  && ageJson="$age"
+        [ -n "$sid" ]  && sidJson="\"$(json_escape "$sid")\""
+        [ -n "$transcript" ] && trJson="\"$(json_escape "$transcript")\""
+        [ -n "$sid" ]  && resumeJson="\"claude --resume $(json_escape "$sid")\""
+        printf '    {"pid": %s, "sessionId": %s, "rssMb": %s, "ageSeconds": %s, "idleSeconds": %s, "decision": "%s", "reason": "%s", "transcript": %s, "resume": %s}' \
+            "$pid" "$sidJson" "$rssMb" "$ageJson" "$idleJson" "$decision" "$reason" "$trJson" "$resumeJson"
+    done <<< "$RECORDS"
+    [ "$first" -eq 0 ] && printf '\n  '
+    printf ']\n}\n'
 }
 
 log_findings() {
@@ -288,7 +401,7 @@ log_findings() {
     {
         printf '[%s] [%s] %s parked session(s), ~%sMB (idle>%sh)\n' \
             "$(date '+%Y-%m-%d %H:%M')" "$mode_tag" "$N" "$(( TOTAL_KB/1024 ))" "$IDLE_HOURS"
-        printf '%s' "$REAPED_REPORT"
+        reap_report
     } >> "$LOG_FILE" 2>/dev/null || true
 }
 
@@ -299,60 +412,63 @@ print_scan_header() {
     say "  ────────────────────────────────────────────────────────"
 }
 
-# ── Subcommands ─────────────────────────────────────────────────
-cmd_status() {
-    scan
-    print_scan_header "mode: status (read-only)"
-    if [ "$N" -eq 0 ]; then
-        say "  Nothing parked — no idle, non-working sessions."
-        return 0
-    fi
-    printf '%s' "$REAPED_REPORT"
-    say "  ────────────────────────────────────────────────────────"
-    say "  $N parked session(s)  ≈ $(( TOTAL_KB/1024 )) MB reclaimable"
-    say "  (run 'claude-reaper reap' to reclaim — recoverable via claude --resume)"
-}
-
-cmd_reap() {
-    scan
-    local killing=1
-    [ "$DRY_RUN" -eq 1 ] && killing=0
-    print_scan_header "$([ "$killing" -eq 1 ] && echo 'mode: REAP' || echo 'mode: dry-run')"
-    if [ "$N" -eq 0 ]; then
-        say "  Nothing to reap."
-        return 0
-    fi
-    printf '%s' "$REAPED_REPORT"
-    say "  ────────────────────────────────────────────────────────"
-    say "  $N parked session(s)  ≈ $(( TOTAL_KB/1024 )) MB"
-
-    log_findings "$([ "$killing" -eq 1 ] && echo KILL || echo DRY)"
-
-    if [ "$killing" -eq 0 ]; then
-        say "  (dry-run — logged to $LOG_FILE)"
-        return 0
-    fi
-
-    # SIGTERM (let handlers run), pause, then SIGKILL survivors.
-    local pid
-    for pid in $REAP_TREE; do kill -TERM "$pid" 2>/dev/null || true; done
-    sleep 2
-    for pid in $REAP_TREE; do kill -0 "$pid" 2>/dev/null && kill -KILL "$pid" 2>/dev/null || true; done
-
-    local summary="Reaped $N idle Claude session(s), ~$(( TOTAL_KB/1024 ))MB freed (idle>${IDLE_HOURS}h). Recoverable via claude --resume."
-    say "  $summary"
-    notify "$summary"
-}
-
 # Fire the notify hook / command, best-effort. Summary + per-session report on stdin.
 notify() {
-    local payload="$1
-$REAPED_REPORT"
+    local payload; payload="$1
+$(reap_report)"
     if [ -n "$NOTIFY_HOOK" ]; then
         printf '%s' "$payload" | "$NOTIFY_HOOK" >/dev/null 2>&1 || true
     elif [ -n "$NOTIFY_CMD" ]; then
         printf '%s' "$payload" | sh -c "$NOTIFY_CMD" >/dev/null 2>&1 || true
     fi
+}
+
+do_kill() {
+    local pid
+    for pid in $REAP_TREE; do kill -TERM "$pid" 2>/dev/null || true; done
+    sleep 2
+    for pid in $REAP_TREE; do kill -0 "$pid" 2>/dev/null && kill -KILL "$pid" 2>/dev/null || true; done
+}
+
+# ── Subcommands ─────────────────────────────────────────────────
+cmd_status() {
+    scan
+    if [ "$JSON" -eq 1 ]; then emit_json status; return 0; fi
+    print_scan_header "mode: status (read-only)"
+    if [ "$EXPLAIN" -eq 1 ]; then print_explain; elif [ "$N" -gt 0 ]; then reap_report; fi
+    say "  ────────────────────────────────────────────────────────"
+    if [ "$N" -eq 0 ]; then
+        say "  Nothing parked — no idle, non-working sessions."
+        [ "$EXPLAIN" -eq 0 ] && say "  ( --explain shows every session and why it was kept or skipped )"
+    else
+        say "  $N parked session(s)  ≈ $(( TOTAL_KB/1024 )) MB reclaimable"
+        say "  (run 'claude-reaper reap' to reclaim — recoverable via claude --resume)"
+    fi
+}
+
+cmd_reap() {
+    scan
+    local killing=1; [ "$DRY_RUN" -eq 1 ] && killing=0
+    if [ "$JSON" -eq 1 ]; then
+        [ "$killing" -eq 1 ] && do_kill
+        emit_json reap
+        return 0
+    fi
+    if [ "$QUIET" -eq 0 ]; then
+        print_scan_header "$([ "$killing" -eq 1 ] && echo 'mode: REAP' || echo 'mode: dry-run')"
+        if [ "$EXPLAIN" -eq 1 ]; then print_explain; elif [ "$N" -gt 0 ]; then reap_report; fi
+        say "  ────────────────────────────────────────────────────────"
+        [ "$N" -eq 0 ] && say "  Nothing to reap." || say "  $N parked session(s)  ≈ $(( TOTAL_KB/1024 )) MB"
+    fi
+    [ "$N" -eq 0 ] && return 0
+
+    log_findings "$([ "$killing" -eq 1 ] && echo KILL || echo DRY)"
+    if [ "$killing" -eq 0 ]; then say "  (dry-run — logged to $LOG_FILE)"; return 0; fi
+
+    do_kill
+    local summary="Reaped $N idle Claude session(s), ~$(( TOTAL_KB/1024 ))MB freed (idle>${IDLE_HOURS}h). Recoverable via claude --resume."
+    say "  $summary"
+    notify "$summary"
 }
 
 cmd_logs() {
@@ -429,7 +545,7 @@ PLIST
             && say "Installed launchd agent → reaps every $(( SCHED_INTERVAL/60 ))min ($LAUNCHD_PLIST)" \
             || die "launchctl bootstrap failed"
     elif [ "$OS" = "Linux" ]; then
-        command -v systemctl >/dev/null 2>&1 || die "systemd not found — install a cron entry manually: */$(( SCHED_INTERVAL/60 )) * * * * $sp --quiet reap"
+        command -v systemctl >/dev/null 2>&1 || die "systemd not found — add a cron entry manually: */$(( SCHED_INTERVAL/60 )) * * * * $sp --quiet reap"
         mkdir -p "$SYSTEMD_DIR"
         cat > "$SYSTEMD_DIR/claude-reaper.service" <<UNIT
 [Unit]
@@ -454,7 +570,7 @@ UNIT
         systemctl --user daemon-reload
         systemctl --user enable --now claude-reaper.timer \
             && say "Installed systemd --user timer → reaps every $(( SCHED_INTERVAL/60 ))min" \
-            || die "systemctl enable failed (is the user instance running? try 'loginctl enable-linger $USER')"
+            || die "systemctl enable failed (try 'loginctl enable-linger $USER')"
     else
         die "Unsupported OS: $OS (macOS + Linux only)"
     fi
@@ -499,7 +615,9 @@ write_config_example() {
 # Also reap parked sessions over this RSS even if not past the idle window:
 # MAX_RSS=4G
 
-# Extend (recommended) or replace the "actively building → spare" process set:
+# Extend (recommended) or replace the "actively building → spare" process set.
+# NOTE: bare node/npm/bun are deliberately NOT in the default — they'd make every
+# session with an MCP-server child immortal. Add specific tools, not runtimes.
 # BUSY_PROCS_EXTRA='bazel|buck2|tup'
 # BUSY_PROCS='only|these|exact|tools'     # advanced: replaces the safe default
 
@@ -528,6 +646,8 @@ main() {
             --interval=*)  FLAG_INTERVAL="${1#*=}"; shift ;;
             --config)      CONFIG_FILE="$2"; shift 2 ;;
             --config=*)    CONFIG_FILE="${1#*=}"; shift ;;
+            --explain|--verbose) EXPLAIN=1; shift ;;
+            --json)        JSON=1; shift ;;
             --quiet)       QUIET=1; shift ;;
             --dry-run)     DRY_RUN=1; shift ;;
             -h|--help)     SUBCMD="help"; shift ;;
@@ -538,7 +658,6 @@ main() {
     [ -z "$SUBCMD" ] && SUBCMD="status"
 
     load_config
-    # Flags override config + built-ins, then recompute derived values.
     [ -n "$FLAG_IDLE" ]     && IDLE_HOURS="$FLAG_IDLE"
     [ -n "$FLAG_GRACE" ]    && GRACE_MINS="$FLAG_GRACE"
     [ -n "$FLAG_CPU" ]      && CPU_WINDOW_SECS="$FLAG_CPU"

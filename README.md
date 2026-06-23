@@ -20,6 +20,7 @@ process, not the idle one, with no recoverability.
 - Finds running Claude Code session processes and the RAM they hold.
 - Reaps **only** ones that are idle past a threshold **and** provably not working.
 - Leaves every conversation resumable — kills the process, never the transcript.
+- Shows its work — `--explain` gives a full keep/reap/skip trail; `--json` makes it scriptable.
 - Runs on a schedule if you want it to (launchd on macOS, systemd on Linux).
 - Stays out of the way: configurable thresholds, `spare`/`notify` hooks.
 
@@ -71,6 +72,8 @@ Requires bash + coreutils. macOS and Linux.
 
 ```sh
 claude-reaper                 # status: what's parked right now (read-only, default)
+claude-reaper status --explain  # EVERY session + why it's kept / reaped / skipped
+claude-reaper status --json   # machine-readable decision report
 claude-reaper reap            # reclaim idle parked sessions
 claude-reaper reap --dry-run  # scan, decide, but never kill
 claude-reaper install         # run it on a schedule (launchd on macOS, systemd --user on Linux)
@@ -80,6 +83,23 @@ claude-reaper config          # show effective settings + where they came from
 ```
 
 `status` is always safe. Only `reap` (without `--dry-run`) kills anything.
+
+### See why
+
+When `status` says "nothing parked," `--explain` shows the decision for every
+candidate so you can tell *correct* from *misconfigured*:
+
+```text
+KEEP pid 71481  324MB  -           cse_01C4At…  this session / protected
+KEEP pid 82272  223MB  idle 0h08m  cse_019Fuq…  active within the idle window
+REAP pid 11440  812MB  idle 5h12m  abc123…      idle, no CPU, no busy descendants
+SKIP pid 1190   -      -           -            has --session-id but didn't match SESSION_MATCH (adjust config?)
+```
+
+That last line is the tell when the tool finds nothing on a non-standard install.
+`--json` emits the same decisions machine-readably (stable `decision`/`reason`
+fields) for hooks, dashboards, and tests — `--explain` and `--json` compose with
+both `status` and `reap --dry-run`.
 
 ## Configure
 
